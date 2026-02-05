@@ -404,7 +404,7 @@ function getExchangeRate() external view returns (uint256) {
 
 **Full Sample Finding Report**:  
 
-See `CLIENT-SAMPLE-FINDING-VG005.md` for a complete 300+ line finding report demonstrating this format.
+See [CLIENT-SAMPLE-FINDING-VG005](CLIENT-SAMPLE-FINDING-VG005.md) for a complete finding report demonstrating this format.
 
 ---
 
