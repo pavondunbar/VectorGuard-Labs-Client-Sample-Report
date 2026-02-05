@@ -288,6 +288,189 @@ cast call 0x0E8aD62C468E6614C21E63a1cc24578e83254A5B \
 
 ---
 
+## EVM Opcode Analysis
+
+This section examines the vulnerability at the bytecode level, demonstrating exactly how the EVM processes the unsafe type conversion.
+
+### Relevant Opcodes
+
+| Opcode | Hex | Description | Role in Vulnerability |
+|--------|-----|-------------|----------------------|
+| `SIGNEXTEND` | `0x0B` | Sign-extends smaller integers | Not used - would preserve sign |
+| `MLOAD/MSTORE` | `0x51/0x52` | Memory operations | Stores int256, loads as uint256 |
+| `CALLDATALOAD` | `0x35` | Load call data | Reads price as raw 256 bits |
+| `ISZERO` | `0x15` | Check if zero | Could detect negative (not used) |
+| `SLT` | `0x12` | Signed less than | Could validate price > 0 (not used) |
+
+### Assembly-Level Proof
+
+The following assembly test demonstrates exactly how the EVM handles this conversion:
+
+```solidity
+function assemblyTest_SignedToUnsigned(int256 signedVal) external returns (uint256 unsignedVal) {
+    assembly {
+        // Direct assignment - just reinterprets the 256 bits
+        // No opcode changes the value - it's pure bit reinterpretation
+        unsignedVal := signedVal
+    }
+
+    // At the EVM level, both int256 and uint256 are just 32-byte words
+    // The "type" only exists at the Solidity compiler level
+    // The EVM sees: 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+    // Solidity interprets this as either -1 (int256) or 2^256-1 (uint256)
+}
+```
+
+### Bytecode Analysis
+
+When Solidity compiles `uint256(price)` where `price` is `int256`, it generates:
+
+```
+// No conversion opcodes are emitted!
+// The EVM stack simply holds the 256-bit value
+// Interpretation as signed/unsigned is purely semantic
+
+PUSH1 0x00      // Stack position for price
+CALLDATALOAD    // Load 256-bit value from calldata
+                // Value on stack: 0xFF...FF (if price = -1)
+
+// Direct use - no conversion needed at bytecode level
+// The compiler just treats the same bits differently
+```
+
+### Two's Complement Demonstration
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    TWO'S COMPLEMENT IN EVM                       │
+└─────────────────────────────────────────────────────────────────┘
+
+int256(-1) binary representation:
+┌────────────────────────────────────────────────────────────────┐
+│ 1111 1111 1111 1111 ... 1111 1111 1111 1111  (256 bits, all 1s)│
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              │ uint256() cast
+                              │ (no bytecode change)
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│ 1111 1111 1111 1111 ... 1111 1111 1111 1111  (same 256 bits)   │
+└────────────────────────────────────────────────────────────────┘
+
+Interpreted as uint256:
+= 2^256 - 1
+= 115,792,089,237,316,195,423,570,985,008,687,907,853,269,984,665,640,564,039,457,584,007,913,129,639,935
+```
+
+### EVM Test Contract
+
+```solidity
+contract EVMOpcodeTests {
+    event OpcodeResult(
+        string opcode,
+        bytes32 input,
+        bytes32 output,
+        bool success
+    );
+
+    /**
+     * @notice Test signed to unsigned conversion at assembly level (VG-005)
+     * @dev Shows how SIGNEXTEND and type casting work at opcode level
+     */
+    function assemblyTest_SignedToUnsigned(int256 signedVal)
+        external
+        returns (uint256 unsignedVal)
+    {
+        assembly {
+            // Direct assignment - just reinterprets the bits
+            unsignedVal := signedVal
+        }
+
+        bytes32 input;
+        bytes32 output;
+        assembly {
+            input := signedVal
+            output := unsignedVal
+        }
+
+        // input and output are IDENTICAL at the byte level
+        // Only the type interpretation differs
+        emit OpcodeResult("SIGNED_TO_UNSIGNED", input, output, signedVal < 0);
+
+        return unsignedVal;
+    }
+
+    /**
+     * @notice Demonstrate what SHOULD happen - proper validation
+     */
+    function assemblyTest_SafeConversion(int256 signedVal)
+        external
+        pure
+        returns (uint256 unsignedVal)
+    {
+        assembly {
+            // Use SLT (signed less than) to check if negative
+            // SLT compares signedVal < 0, returns 1 if true
+            if slt(signedVal, 0) {
+                // Revert with "Negative price" error
+                mstore(0x00, 0x08c379a0)  // Error selector
+                mstore(0x04, 0x20)        // String offset
+                mstore(0x24, 0x0e)        // String length
+                mstore(0x44, "Negative price")
+                revert(0x00, 0x64)
+            }
+            unsignedVal := signedVal
+        }
+    }
+}
+```
+
+### Gas Cost Analysis
+
+| Operation | Gas Cost | Notes |
+|-----------|----------|-------|
+| `CALLDATALOAD` | 3 | Load price from calldata |
+| Type cast (int256 → uint256) | 0 | No opcode - just reinterpretation |
+| `SLT` (signed comparison) | 3 | Would detect negative values |
+| `ISZERO` | 3 | Zero check |
+| `JUMPI` (conditional) | 10 | Branch on validation |
+| **Validation overhead** | **~16 gas** | Trivial cost to prevent exploit |
+
+### Why This Matters
+
+1. **No Runtime Protection**: The EVM provides no automatic type safety between signed and unsigned integers. The conversion happens at compile-time as a semantic reinterpretation, not a runtime operation.
+
+2. **Invisible Vulnerability**: Since no opcodes are generated for the cast, static analysis tools looking for specific opcode patterns may miss this vulnerability.
+
+3. **Trivial Fix Cost**: Adding `SLT` (signed less than) comparison costs only 3 gas but prevents catastrophic loss.
+
+4. **Compiler Trust**: Developers incorrectly assume Solidity's type system provides protection that only exists at compile-time, not runtime.
+
+### Opcode-Level Mitigation
+
+The fix at the assembly level requires explicit signed comparison:
+
+```solidity
+assembly {
+    // Load price from oracle return data
+    let price := calldataload(0x24)
+
+    // SLT: Signed Less Than - checks if price < 0
+    // Returns 1 if price is negative, 0 otherwise
+    if slt(price, 0) {
+        // Revert immediately - do not proceed with negative price
+        revert(0, 0)
+    }
+
+    // Safe to use price as unsigned after validation
+    // Store result
+    mstore(0x00, price)
+}
+```
+
+
+---
+
 ## Remediation
 
 ### Recommended Fix
